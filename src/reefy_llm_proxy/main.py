@@ -25,7 +25,10 @@ log = logging.getLogger('reefy-llm-proxy')
 # can reach them without globals.
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    store = CredentialStore(config.CREDENTIALS_FILE)
+    store = CredentialStore(
+        attach_path=config.CREDENTIALS_FILE,
+        runtime_path=config.CREDENTIALS_RUNTIME_FILE,
+    )
     client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0))
     registry = ModelRegistry(
         cache_file=config.MODELS_CACHE_FILE,

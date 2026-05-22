@@ -13,7 +13,19 @@ LISTEN_HOST = os.environ.get('LISTEN_HOST', '0.0.0.0')
 LISTEN_PORT = int(os.environ.get('LISTEN_PORT', '9080'))
 
 DATA_DIR = Path(os.environ.get('DATA_DIR', '/data'))
+# Two-file model:
+#   credentials.json         - reconciler-owned, overwritten on every
+#                              state apply. Holds the "what the user
+#                              attached" snapshot.
+#   credentials.runtime.json - proxy-owned. Holds rotated tokens.
+#                              The proxy prefers this if its mtime is
+#                              >= credentials.json's mtime (i.e. we
+#                              rotated AFTER the last attach); if
+#                              credentials.json is newer, the user
+#                              just re-attached and we drop the
+#                              runtime copy.
 CREDENTIALS_FILE = DATA_DIR / 'credentials.json'
+CREDENTIALS_RUNTIME_FILE = DATA_DIR / 'credentials.runtime.json'
 MODELS_CACHE_FILE = DATA_DIR / 'models-cache.json'
 
 # How long a /v1/models pull is considered fresh before re-fetching.
