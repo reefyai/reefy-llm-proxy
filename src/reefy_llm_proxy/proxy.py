@@ -42,10 +42,15 @@ _HOP_BY_HOP = {
 }
 
 # Headers we drop from the upstream response before returning to the
-# client. Streaming responses keep `content-type` (so SSE works).
+# client. `content-length` is dropped because FastAPI's
+# StreamingResponse re-chunks the body; `transfer-encoding` /
+# `connection` are hop-by-hop per RFC 7230 §6.1. `content-encoding`
+# is END-TO-END and MUST pass through - if the upstream gzipped the
+# body, the client needs that header to decompress.
 _RESPONSE_DROP = {
-    'content-encoding', 'transfer-encoding', 'connection',
-    'content-length',
+    'transfer-encoding', 'connection', 'content-length',
+    'keep-alive', 'te', 'trailer', 'upgrade',
+    'proxy-authenticate', 'proxy-authorization',
 }
 
 
