@@ -42,13 +42,14 @@ _HOP_BY_HOP = {
 }
 
 # Headers we drop from the upstream response before returning to the
-# client. `content-length` is dropped because FastAPI's
-# StreamingResponse re-chunks the body; `transfer-encoding` /
-# `connection` are hop-by-hop per RFC 7230 §6.1. `content-encoding`
-# is END-TO-END and MUST pass through - if the upstream gzipped the
-# body, the client needs that header to decompress.
+# client. We always decompress upstream's response body before
+# forwarding (see _stream_with_stats - uses aiter_bytes which decodes
+# automatically), so content-encoding and content-length both have
+# to be dropped (their values reference the compressed/original size,
+# which our outgoing chunked stream no longer matches).
 _RESPONSE_DROP = {
-    'transfer-encoding', 'connection', 'content-length',
+    'content-encoding', 'content-length',
+    'transfer-encoding', 'connection',
     'keep-alive', 'te', 'trailer', 'upgrade',
     'proxy-authenticate', 'proxy-authorization',
 }
@@ -156,10 +157,11 @@ async def _stream_with_stats(
     provider: str,
     model: str,
 ) -> AsyncIterator[bytes]:
-    """Iterate over the upstream response chunks, mirroring them to
-    the client and incrementing token counters opportunistically."""
+    """Iterate over the upstream response chunks, decoded (httpx
+    aiter_bytes handles gzip/br/zstd transparently), mirror them to
+    the client and increment token counters opportunistically."""
     try:
-        async for chunk in response.aiter_raw():
+        async for chunk in response.aiter_bytes():
             _update_token_stats_from_chunk(chunk, provider, model)
             yield chunk
     finally:
