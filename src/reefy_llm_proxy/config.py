@@ -27,6 +27,10 @@ DATA_DIR = Path(os.environ.get('DATA_DIR', '/data'))
 CREDENTIALS_FILE = DATA_DIR / 'credentials.json'
 CREDENTIALS_RUNTIME_FILE = DATA_DIR / 'credentials.runtime.json'
 MODELS_CACHE_FILE = DATA_DIR / 'models-cache.json'
+# Lifetime request + token counters. Re-loaded on startup so the
+# /internal/stats endpoint (and the dashboard graph fed from it)
+# stays cumulative across container restarts.
+STATS_FILE = DATA_DIR / 'stats.json'
 
 # How long a /v1/models pull is considered fresh before re-fetching.
 # Provider model lists change on the order of weeks; 24h is plenty.

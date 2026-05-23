@@ -64,6 +64,7 @@ async def lifespan(app: FastAPI):
         attach_path=config.CREDENTIALS_FILE,
         runtime_path=config.CREDENTIALS_RUNTIME_FILE,
     )
+    stats.enable_persistence(config.STATS_FILE)
     client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0))
     registry = ModelRegistry(
         cache_file=config.MODELS_CACHE_FILE,

@@ -67,6 +67,7 @@ The proxy uses **two files** with disjoint writers:
 |---|---|---|
 | `$DATA_DIR/credentials.json` | The user (or any external system you point at it) | "What was attached" snapshot. Holds the OAuth pair the user obtained via the provider's device-code flow. Proxy NEVER writes here. |
 | `$DATA_DIR/credentials.runtime.json` | The proxy | Rotated state. Written after every successful OAuth refresh. Includes a `derived_from_attach` map (see below). |
+| `$DATA_DIR/stats.json` | The proxy | Lifetime request + token counters surfaced via `/internal/stats`. Loaded on startup so the counters survive container restarts. Written atomically after every increment. |
 
 Both files have mode `0600` and contain the same `providers` shape:
 
