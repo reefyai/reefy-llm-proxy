@@ -258,7 +258,8 @@ async def forward(
             else:
                 cred = current     # someone else refreshed while we waited
         response = await _forward_once(
-            client, request.method, upstream_url, fwd_headers, body, cred)
+            client, request.method, upstream_url, fwd_headers, body, cred,
+            params=spec.extra_query_params or None)
 
     bare_model = _strip_model_prefix(model) if model else ''
     if response.status_code < 400 and bare_model:
