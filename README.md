@@ -47,6 +47,18 @@ All via env vars.
 | `MODELS_CACHE_TTL_S` | `86400` | How long /v1/models cache is fresh |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
 
+## Security model
+
+`LISTEN_HOST=0.0.0.0` inside the container is intentional - the
+proxy is designed to be reached via a private docker bridge network
+(e.g. `reefy-llm`) where every member is a trusted app you wired in.
+**There is no auth on any route**, including `/v1/*` and
+`/internal/stats`. The bridge network IS the access boundary.
+
+If you publish the container port on the host (e.g.
+`-p 127.0.0.1:9080:9080`), every local process on that host can use
+your subscription LLM credentials with no authentication.
+
 ## Credential lifecycle
 
 The proxy uses **two files** with disjoint writers:
