@@ -47,10 +47,16 @@ All via env vars.
 | `MODELS_CACHE_TTL_S` | `86400` | How long /v1/models cache is fresh |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
 
-## Credentials file shape
+## Credential lifecycle
 
-`$DATA_DIR/credentials.json`, mode 0600. The proxy reads it on
-startup and re-reads it after each refresh:
+The proxy uses **two files** with disjoint writers:
+
+| File | Writer | Role |
+|---|---|---|
+| `$DATA_DIR/credentials.json` | The user (or any external system you point at it) | "What was attached" snapshot. Holds the OAuth pair the user obtained via the provider's device-code flow. Proxy NEVER writes here. |
+| `$DATA_DIR/credentials.runtime.json` | The proxy | Rotated state. Written after every successful OAuth refresh. Includes a `derived_from_attach` map (see below). |
+
+Both files have mode `0600` and contain the same `providers` shape:
 
 ```json
 {
@@ -69,8 +75,62 @@ startup and re-reads it after each refresh:
 }
 ```
 
-When upstream rotates the refresh_token (xAI and codex both do), the
-new chain replaces the old one on disk before the retry fires.
+`credentials.runtime.json` carries one additional top-level field:
+
+```json
+{
+  "providers": { ... },
+  "derived_from_attach": {
+    "xai":   "rt_originalAttachRefreshTokenForXai...",
+    "codex": "rt_originalAttachRefreshTokenForCodex..."
+  }
+}
+```
+
+`derived_from_attach[slug]` records the `refresh_token` that was in
+`credentials.json` at the moment this rotation chain began. The
+proxy stamps it on every persist; it stays stable across multiple
+rotations within the same chain.
+
+### Why two files
+
+The access_token expires (hours to days), so the proxy has to
+refresh and persist new tokens. The attach file holds the
+user-controlled origin (months-stable) and shouldn't be mutated by
+the proxy. Splitting writers means any rewrite of the attach file
+(e.g. routine config sync, an idempotent re-deploy of an
+infrastructure script) does NOT clobber the proxy's rotated chain.
+
+### Chain-merge rule on load
+
+For each provider slug present in `credentials.json`:
+
+| Runtime has slug? | `runtime.derived_from_attach[slug] == attach.refresh_token`? | Action |
+|---|---|---|
+| no | n/a | use attach (first run, or rotation has never happened yet) |
+| yes | yes | use runtime (rotation chain is alive, anchored to this very attach token) |
+| yes | no | use attach, treat runtime entry as stale (user re-attached: attach now holds a different `refresh_token` than the chain was started from) |
+
+Comparison is on `refresh_token` **values**, not file mtimes. A real
+re-attach always mints a server-side-fresh refresh_token, so
+value-equality is the exact "is this still the same chain" signal.
+File mtimes lie - any rewrite of `credentials.json` bumps mtime even
+when the bytes are unchanged.
+
+### Re-loading on attach-file change
+
+The proxy watches `credentials.json` via inotify (through
+`watchfiles`). When the file is modified, added, or atomically
+replaced (tempfile + rename), the proxy re-runs the merge above and
+swaps its in-memory vault. No restart required.
+
+Practical effect:
+
+- Update `credentials.json` with a freshly-obtained OAuth pair →
+  proxy notices within ~milliseconds → next request uses the new
+  pair → no container restart, no dropped connections.
+- Same file written with identical bytes → merge re-runs, picks the
+  same winners → no observable change.
 
 ## Local development
 
