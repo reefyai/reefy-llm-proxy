@@ -121,16 +121,51 @@ async def _resolve_provider(
     )
 
 
+def _extract_usage(obj: object) -> tuple[int, int] | None:
+    """Pull (prompt, completion) token counts out of an upstream JSON
+    body. Returns None if no usage block is present. Two upstream
+    shapes are recognised:
+
+      ChatCompletions (xAI, classic OpenAI):
+        {"usage": {"prompt_tokens": N, "completion_tokens": M}}
+
+      Responses API (codex SSE event payload):
+        {"type": "response.completed",
+         "response": {"usage": {"input_tokens": N, "output_tokens": M}}}
+
+    The Responses API also emits `usage: null` on intermediate events
+    (response.created, response.in_progress, ...) - only the final
+    `response.completed` event carries non-null counts, so the recursion
+    naturally records exactly once per request."""
+    if not isinstance(obj, dict):
+        return None
+    usage = obj.get('usage')
+    if isinstance(usage, dict):
+        prompt = (
+            usage.get('prompt_tokens')
+            or usage.get('input_tokens')
+            or 0
+        )
+        completion = (
+            usage.get('completion_tokens')
+            or usage.get('output_tokens')
+            or 0
+        )
+        if prompt or completion:
+            return int(prompt), int(completion)
+    # Nested under .response for the Responses API event stream.
+    return _extract_usage(obj.get('response'))
+
+
 def _update_token_stats_from_chunk(
     chunk: bytes, provider: str, model: str,
 ) -> None:
     """Best-effort: if the upstream response chunk contains a JSON
-    body with usage info (non-streaming case), record tokens. For
-    SSE streams the per-event payloads usually don't carry usage
-    except at the end; we read those too. Silent on parse failure -
+    body with usage info, record tokens. Silent on parse failure -
     counters are observability, not correctness."""
     try:
-        # SSE lines look like "data: {...}\n\n"
+        # SSE lines look like "data: {...}\n\n". For non-streaming
+        # JSON bodies the whole chunk is the document.
         for line in chunk.split(b'\n'):
             line = line.strip()
             if line.startswith(b'data:'):
@@ -141,13 +176,10 @@ def _update_token_stats_from_chunk(
                 obj = json.loads(line)
             except (ValueError, json.JSONDecodeError):
                 continue
-            usage = obj.get('usage') if isinstance(obj, dict) else None
-            if isinstance(usage, dict):
-                stats.add_tokens(
-                    provider, model,
-                    int(usage.get('prompt_tokens', 0) or 0),
-                    int(usage.get('completion_tokens', 0) or 0),
-                )
+            usage = _extract_usage(obj)
+            if usage:
+                p, c = usage
+                stats.add_tokens(provider, model, p, c)
     except Exception:
         pass
 
