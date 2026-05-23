@@ -175,6 +175,7 @@ async def _forward_once(
     headers: dict,
     body: bytes,
     cred: Credential,
+    params: dict[str, str] | None = None,
 ) -> httpx.Response:
     """Open a streaming request to upstream and return the response
     object (caller is responsible for closing). Uses retry.py for
@@ -183,7 +184,8 @@ async def _forward_once(
 
     async def _do() -> httpx.Response:
         req = client.build_request(
-            method, upstream_url, headers=hdrs, content=body)
+            method, upstream_url, headers=hdrs, content=body,
+            params=params or None)
         return await client.send(req, stream=True)
 
     return await request_with_retry(
@@ -234,7 +236,8 @@ async def forward(
 
     # First attempt.
     response = await _forward_once(
-        client, request.method, upstream_url, fwd_headers, body, cred)
+        client, request.method, upstream_url, fwd_headers, body, cred,
+        params=spec.extra_query_params or None)
 
     # 401 -> refresh + retry once.
     if response.status_code == 401:

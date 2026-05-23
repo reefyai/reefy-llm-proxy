@@ -94,6 +94,7 @@ class ModelRegistry:
             return await self._client.get(
                 f'{spec.base_url}/models',
                 headers={'Authorization': f'Bearer {cred.access_token}'},
+                params=spec.extra_query_params or None,
             )
 
         try:
@@ -114,10 +115,10 @@ class ModelRegistry:
             log.warning('models[%s]: invalid json', slug)
             return None
 
-        data = body.get('data')
+        data = body.get(spec.models_list_key)
         if not isinstance(data, list):
             return None
-        ids = [m.get('id') for m in data if isinstance(m, dict)]
+        ids = [m.get(spec.model_id_key) for m in data if isinstance(m, dict)]
         return [m for m in ids if isinstance(m, str)]
 
     async def _maybe_refresh(self) -> None:

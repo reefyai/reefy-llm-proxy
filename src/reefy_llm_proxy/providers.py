@@ -12,7 +12,7 @@ that were attached via Reefy's device-code OAuth flow (which itself
 also uses these public client_ids - see oauth_proxy.py).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -21,6 +21,14 @@ class ProviderSpec:
     base_url: str        # upstream OpenAI-compat API root
     token_url: str       # OAuth refresh endpoint
     client_id: str       # OAuth client_id (public; not a secret)
+    # Defaults match the OpenAI /v1 shape (xAI follows it). Codex's
+    # backend-api is OpenAI-flavoured but not OpenAI-compatible: every
+    # call requires a `?client_version=<semver>` query param, and the
+    # /models response uses `{"models": [{"slug": "..."}]}` instead of
+    # the spec's `{"data": [{"id": "..."}]}`.
+    extra_query_params: dict[str, str] = field(default_factory=dict)
+    models_list_key: str = 'data'
+    model_id_key: str = 'id'
 
 
 # Source for these constants:
@@ -29,6 +37,11 @@ class ProviderSpec:
 #          reefy-service app/routes/oauth_proxy.py PROVIDERS['xai-oauth']
 #   codex: https://github.com/openai/codex/blob/main/codex-rs/login/src/auth/manager.rs
 #          reefy-service app/routes/oauth_proxy.py PROVIDERS['openai-codex']
+#
+# Codex client_version: the value the upstream backend gates request
+# shape on. Bump in lockstep with the official codex-cli release we
+# track so response fields (e.g. prefer_websockets in /models) match
+# what our parser expects.
 PROVIDERS: dict[str, ProviderSpec] = {
     'xai': ProviderSpec(
         slug='xai',
@@ -41,6 +54,9 @@ PROVIDERS: dict[str, ProviderSpec] = {
         base_url='https://chatgpt.com/backend-api/codex',
         token_url='https://auth.openai.com/oauth/token',
         client_id='app_EMoamEEZ73f0CkXaXp7hrann',
+        extra_query_params={'client_version': '0.21.0'},
+        models_list_key='models',
+        model_id_key='slug',
     ),
 }
 
