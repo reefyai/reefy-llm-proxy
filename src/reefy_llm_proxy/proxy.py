@@ -14,6 +14,7 @@ Flow per inbound /v1/{path}:
   7. On 2xx: increment counters from the upstream's `usage` block.
 """
 
+import base64
 import json
 import logging
 from typing import AsyncIterator
@@ -30,6 +31,44 @@ from .retry import request_with_retry
 from .stats import stats
 
 log = logging.getLogger(__name__)
+
+
+def _extract_chatgpt_account_id(access_token: str) -> str | None:
+    """Pull `chatgpt_account_id` out of the codex JWT's claims.
+
+    The codex backend requires a `ChatGPT-Account-ID` header to scope
+    the request to the right ChatGPT account (a single OAuth client
+    can have access to multiple). The codex-rs CLI extracts it from
+    the JWT's `https://api.openai.com/auth.chatgpt_account_id` claim;
+    we mirror that. Returns None on malformed tokens - caller treats
+    None as "don't send the header" (request still proceeds, surfaces
+    as a 401 if upstream actually needs it, instead of crashing here)."""
+    try:
+        parts = access_token.split('.')
+        if len(parts) < 2:
+            return None
+        payload = parts[1] + '=' * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        auth = claims.get('https://api.openai.com/auth') or {}
+        acct = auth.get('chatgpt_account_id')
+        if isinstance(acct, str) and acct:
+            return acct
+    except (ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def _provider_headers(spec: providers.ProviderSpec, cred: Credential) -> dict:
+    """Provider-specific headers to inject on outgoing requests.
+    Combines the static `spec.extra_headers` with per-credential
+    dynamic headers (currently just codex's ChatGPT-Account-ID
+    extracted from the bearer JWT)."""
+    out = dict(spec.extra_headers or {})
+    if spec.slug == 'codex':
+        acct = _extract_chatgpt_account_id(cred.access_token)
+        if acct:
+            out['ChatGPT-Account-ID'] = acct
+    return out
 
 
 # Headers we strip from the inbound request before forwarding.
@@ -265,6 +304,11 @@ async def forward(
 
     upstream_url = f'{spec.base_url.rstrip("/")}/{path.lstrip("/")}'
     fwd_headers = _filter_request_headers(dict(request.headers))
+    # Provider-specific headers override anything the client passed.
+    # For codex this carries the Cloudflare-required originator + a
+    # codex-CLI-shaped User-Agent + ChatGPT-Account-ID. For xAI and
+    # any new OpenAI-shape provider this is a no-op (empty dict).
+    fwd_headers.update(_provider_headers(spec, cred))
 
     # First attempt.
     response = await _forward_once(

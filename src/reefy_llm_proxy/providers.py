@@ -29,6 +29,13 @@ class ProviderSpec:
     extra_query_params: dict[str, str] = field(default_factory=dict)
     models_list_key: str = 'data'
     model_id_key: str = 'id'
+    # Headers injected on every forwarded request (after stripping the
+    # client's hop-by-hop headers but before the proxy sets its own
+    # Authorization). Used by the codex provider to advertise an
+    # allowed Cloudflare originator and a codex-CLI-shaped User-Agent;
+    # without these, chatgpt.com/backend-api/codex returns 403 with
+    # `cf-mitigated: challenge` from non-residential IPs.
+    extra_headers: dict[str, str] = field(default_factory=dict)
 
 
 # Source for these constants:
@@ -57,6 +64,27 @@ PROVIDERS: dict[str, ProviderSpec] = {
         extra_query_params={'client_version': '0.21.0'},
         models_list_key='models',
         model_id_key='slug',
+        # Cloudflare in front of chatgpt.com/backend-api/codex
+        # whitelists a small set of first-party originators
+        # (codex_cli_rs, codex_vscode, codex_sdk_ts, anything
+        # starting with `Codex`). Requests from non-residential IPs
+        # or without an allowed originator get 403 + cf-mitigated:
+        # challenge regardless of bearer-token validity.
+        #
+        # Same headers + ChatGPT-Account-ID extraction that
+        # hermes-agent and openclaw inject when they call the codex
+        # backend directly. Their docs explicitly note these are NOT
+        # added by the clients when they go through a generic
+        # OpenAI-compatible proxy, so the responsibility for the
+        # Cloudflare passthrough lands here. References:
+        #   - hermes:   auxiliary_client.py::_codex_cloudflare_headers
+        #   - openclaw: docs/concepts/model-providers.md (codex section)
+        # ChatGPT-Account-ID is dynamic (extracted from the bearer
+        # JWT's claims) and injected per-request in proxy.py.
+        extra_headers={
+            'User-Agent': 'codex_cli_rs/0.21.0 (reefy-llm-proxy)',
+            'originator': 'codex_cli_rs',
+        },
     ),
 }
 

@@ -12,6 +12,75 @@ vanilla OpenAI-compatible HTTP API. Apps don't see OAuth, refresh,
 or rotation - they just point at `OPENAI_BASE_URL=http://...:9080/v1`
 and use the OpenAI SDK they'd use anywhere else.
 
+## Acceptable use & disclaimer
+
+> **USE AT YOUR OWN RISK.** This software is provided "AS IS",
+> without warranty of any kind, express or implied. The authors and
+> contributors accept no liability for any consequence of running it
+> — including, but not limited to, suspension or termination of
+> accounts with upstream LLM providers, loss of subscription credit,
+> rate-limit lockouts, or data loss. **You are solely responsible
+> for ensuring your use complies with the Terms of Service of every
+> upstream provider whose credentials you attach.** Provider
+> policies change without notice; review them periodically.
+
+### What this proxy is (and is permitted)
+
+- A **single-user** proxy running on a device you own, forwarding
+  requests from apps you also own/run, all on the same machine or
+  same private bridge network.
+- Authentication via OAuth tokens minted by the providers' own
+  device-code flows (`auth.openai.com/oauth/token`,
+  `auth.x.ai/oauth2/token`), explicitly built for headless /
+  terminal / developer-tool consumption.
+- Backend endpoints exposed for exactly this use case:
+  `chatgpt.com/backend-api/codex` and `api.x.ai/v1`. **Not** the
+  consumer web UIs (`chatgpt.com`, `grok.com`), no cookie scraping,
+  no headless-browser automation.
+- Cloudflare passthrough headers (`originator`, `User-Agent`)
+  shaped to match the upstream CLIs — the same set hermes-agent
+  and openclaw inject when calling codex directly. The traffic
+  looks exactly like a first-party CLI doing what a first-party
+  CLI does.
+
+Both upstream clients we mirror treat this use case as supported.
+The cleanest public statement is openclaw's codex provider page,
+quoted verbatim: *"Policy note: OpenAI Codex OAuth is explicitly
+supported for external tools/workflows like OpenClaw."* See:
+[github.com/openclaw/openclaw](https://github.com/openclaw/openclaw)
+`docs/concepts/model-providers.md`. xAI's OAuth tier is similarly
+documented as a first-class developer-facing surface.
+
+### What would break that and is NOT permitted
+
+- **Multi-tenant proxying.** Routing requests from people who are
+  not the account owner through one OAuth pool. ToS violation
+  across every provider, and triggers their abuse detection within
+  hours.
+- **Account sharing.** Letting multiple individuals consume one
+  subscription via this proxy.
+- **Commercial reselling.** Charging third parties for access to
+  your account's capacity.
+- **Tying this to consumer web-session credentials** (e.g. SSO
+  cookies extracted from chatgpt.com or grok.com). The proxy
+  doesn't support that path and adding it would put you in scraper
+  territory regardless of what wrapping you put on top.
+- **Unbounded automation loops** that burn through subscription
+  fast-mode quotas at machine speed. Both OpenAI and xAI flag
+  velocity anomalies; an agent in a runaway loop can cost you the
+  account, not just the daily quota.
+
+### Provider policy can change
+
+Subscription-via-OAuth has been allowed for years, but the field
+is in motion: in early 2026 Anthropic narrowed its position around
+third-party-CLI reuse of Claude subscriptions, forcing some users
+back to paid API keys. OpenAI and xAI have not made that change;
+they could. If a provider publishes a new policy, this proxy stops
+being the right fit for that provider and the operator should fall
+back to an official billable API key (`console.x.ai` /
+`platform.openai.com`).
+
 ## Endpoints
 
 - `POST /v1/chat/completions` (and any other `/v1/*` path) - forward
@@ -144,6 +213,75 @@ Practical effect:
   pair → no container restart, no dropped connections.
 - Same file written with identical bytes → merge re-runs, picks the
   same winners → no observable change.
+
+## Per-provider quirks
+
+Each provider speaks an OpenAI-ish API but with subtle differences
+the proxy normalises. Defaults in `ProviderSpec` track the OpenAI
+shape; per-provider entries override what diverges.
+
+### xAI (`api.x.ai/v1`)
+
+Vanilla OpenAI shape. `/models` returns `{data: [{id: ...}]}`, chat
+completions accept the standard ChatCompletions request body, no
+extra headers required. The OAuth bearer is enough; xAI doesn't
+enforce User-Agent / originator gating. (Confirmed by inspecting
+hermes-agent's xAI aux client — it uses a stock `OpenAI(api_key,
+base_url=api.x.ai/v1)` with no `default_headers`.)
+
+### codex (`chatgpt.com/backend-api/codex`)
+
+Not OpenAI-compatible despite the surface similarity. Three
+overrides:
+
+1. **`?client_version=<semver>` query param on every call.**
+   Upstream rejects without it. Pinned to a value matching a real
+   codex-rs CLI release; bump if the response shape we depend on
+   drifts.
+2. **`/models` response uses `{models: [{slug: ...}]}`** instead of
+   `{data: [{id: ...}]}`. Registry maps via `models_list_key` +
+   `model_id_key` overrides.
+3. **Cloudflare originator + User-Agent + ChatGPT-Account-ID
+   headers.** chatgpt.com/backend-api is behind a Cloudflare layer
+   that whitelists a small set of first-party originators
+   (`codex_cli_rs`, `codex_vscode`, `codex_sdk_ts`, anything
+   starting with `Codex`). Requests from non-residential IPs (VPS,
+   server-hosted runners) or without an allowed originator get
+   `HTTP 403` with `cf-mitigated: challenge`, regardless of bearer
+   validity. We send:
+
+   ```
+   User-Agent:           codex_cli_rs/0.21.0 (reefy-llm-proxy)
+   originator:           codex_cli_rs
+   ChatGPT-Account-ID:   <extracted from JWT claim>
+   ```
+
+   `ChatGPT-Account-ID` is extracted per-request from the bearer
+   JWT's `https://api.openai.com/auth.chatgpt_account_id` claim
+   (same path the codex-rs CLI uses). On a malformed token we drop
+   the header rather than fail — the request still goes through and
+   any auth issue surfaces as a clean 401.
+
+   This mirrors what hermes-agent and openclaw inject when they
+   call codex directly. Both of their docs explicitly state these
+   headers are NOT added on their generic OpenAI-compatible proxy
+   path, so the responsibility for the Cloudflare passthrough lands
+   on the proxy in front of codex. Sources (all open):
+
+   - codex-rs CLI (upstream we shape against):
+     [github.com/openai/codex](https://github.com/openai/codex) —
+     authoritative for `User-Agent` / `originator` / account-ID
+     handling.
+   - hermes-agent's direct-codex header builder:
+     `auxiliary_client.py::_codex_cloudflare_headers` in
+     [github.com/NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)
+     — docstring there is the source for the Cloudflare originator
+     whitelist explanation copied above.
+   - openclaw's docs page on the codex provider:
+     [github.com/openclaw/openclaw](https://github.com/openclaw/openclaw)
+     `docs/concepts/model-providers.md` — explicitly states the
+     hidden attribution headers are not added on
+     OpenAI-compatible-proxy paths.
 
 ## Local development
 
