@@ -295,11 +295,34 @@ async def forward(
         return _err(500, f"provider '{provider_slug}' not supported")
 
     # Rewrite the model in the body to its bare form (upstream
-    # doesn't know about our prefixes).
-    if parsed is not None and model:
-        bare = _strip_model_prefix(model)
-        if bare != model:
-            parsed['model'] = bare
+    # doesn't know about our prefixes), and force `stream_options.
+    # include_usage = true` on streaming chat-completions so the
+    # upstream emits a final usage chunk we can count tokens from.
+    # Without this opt-in, OpenAI-shape providers (xAI, openai) omit
+    # usage entirely from streaming responses and our /internal/stats
+    # never increments token counters for the request - even though
+    # the request itself succeeded. Codex's Responses API is exempt
+    # (always emits usage on response.completed), but the inject is
+    # cheap and harmless to spec it everywhere it applies.
+    if parsed is not None:
+        changed = False
+        if model:
+            bare = _strip_model_prefix(model)
+            if bare != model:
+                parsed['model'] = bare
+                changed = True
+        if (
+            path.endswith('chat/completions')
+            and parsed.get('stream') is True
+        ):
+            opts = parsed.get('stream_options')
+            if not isinstance(opts, dict):
+                opts = {}
+            if opts.get('include_usage') is not True:
+                opts['include_usage'] = True
+                parsed['stream_options'] = opts
+                changed = True
+        if changed:
             body = json.dumps(parsed).encode('utf-8')
 
     upstream_url = f'{spec.base_url.rstrip("/")}/{path.lstrip("/")}'
