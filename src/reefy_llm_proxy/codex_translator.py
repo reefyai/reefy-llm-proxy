@@ -187,8 +187,13 @@ def chat_to_responses(body: dict) -> dict:
             else:
                 input_items.append({'role': role, 'content': content})
 
-    if instructions_parts:
-        out['instructions'] = '\n\n'.join(instructions_parts)
+    # Codex requires the `instructions` field even when empty - the
+    # Responses backend returns 400 "Instructions are required"
+    # otherwise. Tools that probe /v1/chat/completions for endpoint
+    # compatibility (openclaw's auto-detect, harness tests) typically
+    # send a single user message with no system prompt; emit an empty
+    # string for them so detection succeeds.
+    out['instructions'] = '\n\n'.join(instructions_parts) if instructions_parts else ''
     out['input'] = input_items
 
     # Tools: ChatCompletions wraps the spec in a `function` sub-object;
