@@ -23,7 +23,7 @@ import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import providers
+from . import codex_translator, providers
 from .credentials import Credential, CredentialStore
 from .refresh import RefreshError, refresh_credential
 from .registry import ModelRegistry
@@ -239,6 +239,27 @@ async def _stream_with_stats(
         await response.aclose()
 
 
+async def _stream_codex_chat_translation(
+    response: httpx.Response,
+    provider: str,
+    model: str,
+) -> AsyncIterator[bytes]:
+    """Codex Responses SSE -> ChatCompletions SSE, with the same
+    stats-update side effect as `_stream_with_stats`. The translator
+    emits ChatCompletions chunks whose final entry carries a
+    `usage: {prompt_tokens, completion_tokens, ...}` block; the
+    existing chunk parser already recognises that shape, so token
+    counting works without a separate codex path."""
+    try:
+        translated = codex_translator.responses_sse_to_chat_sse(
+            response.aiter_bytes(), model)
+        async for chunk in translated:
+            _update_token_stats_from_chunk(chunk, provider, model)
+            yield chunk
+    finally:
+        await response.aclose()
+
+
 async def _forward_once(
     client: httpx.AsyncClient,
     method: str,
@@ -304,7 +325,25 @@ async def forward(
     # the request itself succeeded. Codex's Responses API is exempt
     # (always emits usage on response.completed), but the inject is
     # cheap and harmless to spec it everywhere it applies.
-    if parsed is not None:
+    # Codex backend speaks only the Responses API; ChatCompletions
+    # callers (openclaw default, claude-code, anything OPENAI_BASE_URL-
+    # wired) get translated here. After translation the rest of the
+    # forwarding logic is the same as a Responses-native client; the
+    # response side gets re-translated back to ChatCompletions chunks
+    # below so the client sees what it expected.
+    translate_codex_response = False
+    if (provider_slug == 'codex'
+            and path.endswith('chat/completions')
+            and parsed is not None):
+        # Strip prefix BEFORE translating so the codex spec sees the
+        # bare model.
+        if model:
+            parsed['model'] = _strip_model_prefix(model)
+        parsed = codex_translator.chat_to_responses(parsed)
+        body = json.dumps(parsed).encode('utf-8')
+        path = 'responses'
+        translate_codex_response = True
+    elif parsed is not None:
         changed = False
         if model:
             bare = _strip_model_prefix(model)
@@ -380,9 +419,24 @@ async def forward(
         stats.add_request(provider_slug, bare_model)
 
     resp_headers = _filter_response_headers(dict(response.headers))
+    # Only run the codex chat-completions translator on successful
+    # responses. On a 4xx/5xx upstream we want the raw error body to
+    # reach the client - translating an error response into ChatCompletions
+    # chunk shape would hide the real failure cause.
+    if translate_codex_response and response.status_code < 400:
+        stream_gen = _stream_codex_chat_translation(
+            response, provider_slug, bare_model)
+        # Translator output is ChatCompletions-style SSE (data: ...\n\n);
+        # advertise the right media type regardless of what upstream
+        # set on the codex /responses reply.
+        media_type = 'text/event-stream'
+    else:
+        stream_gen = _stream_with_stats(response, provider_slug, bare_model)
+        media_type = resp_headers.get('content-type')
+
     return StreamingResponse(
-        _stream_with_stats(response, provider_slug, bare_model),
+        stream_gen,
         status_code=response.status_code,
         headers=resp_headers,
-        media_type=resp_headers.get('content-type'),
+        media_type=media_type,
     )
