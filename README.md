@@ -93,6 +93,9 @@ back to an official billable API key (`console.x.ai` /
 - `GET  /internal/stats` - request + token counters (per
   provider/model, prompt vs completion split), for polling
   collectors.
+- `GET  /internal/debug`  - inspect the request-capture flag.
+- `POST /internal/debug`  - flip request capture on/off without
+  restarting. See [Debug capture](#debug-capture) below.
 
 ## Routing
 
@@ -115,6 +118,53 @@ All via env vars.
 | `DATA_DIR` | `/data` | credentials.json + models-cache.json location |
 | `MODELS_CACHE_TTL_S` | `86400` | How long /v1/models cache is fresh |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
+| `REEFY_LLM_PROXY_DEBUG` | unset | If `1`/`true`/`yes`/`on`, start with debug capture on. Hot-toggle at runtime via `/internal/debug`. |
+| `REEFY_LLM_PROXY_DEBUG_DIR` | `/data/debug` | Where per-call JSON dumps go when debug is on. Created on first use. |
+
+## Debug capture
+
+Ad-hoc tool for inspecting proxied traffic. Off by default; flip
+on without a restart:
+
+```bash
+# inspect
+curl -s http://127.0.0.1:9080/internal/debug
+# {"enabled":false,"dump_dir":"/data/debug"}
+
+# turn on
+curl -sX POST http://127.0.0.1:9080/internal/debug \
+  -H 'Content-Type: application/json' -d '{"enabled":true}'
+
+# turn off
+curl -sX POST http://127.0.0.1:9080/internal/debug \
+  -H 'Content-Type: application/json' -d '{"enabled":false}'
+```
+
+While on, every proxied request produces:
+
+- One short summary line in the container journal:
+  `[debug] POST /v1/chat/completions -> codex 200 (in=92B out=8244B 1005ms) dump=/data/debug/<file>.json`
+- One JSON file under `REEFY_LLM_PROXY_DEBUG_DIR` (default
+  `/data/debug`) containing the full inbound body, the translated
+  upstream body (when the proxy rewrote it - e.g. codex
+  ChatCompletions -> Responses), the redacted upstream headers,
+  the response status + headers, and the complete response body
+  (SSE streams included, tee'd chunk-by-chunk).
+
+Headers `Authorization`, `Cookie`, `X-API-Key`, `ChatGPT-Account-ID`,
+`OpenAI-Organization`, and `Proxy-Authorization` are redacted in
+BOTH the journal line and the dump file. Request and response
+bodies are written verbatim - assume the dump dir is sensitive.
+Mount `DATA_DIR` (or `REEFY_LLM_PROXY_DEBUG_DIR`) on persistent
+storage if you want dumps to survive container recreate.
+
+Off-mode cost is one boolean check per request. On-mode adds one
+list-append + b''.join per stream chunk and a single file write at
+stream end. Restarting the container reverts to whatever the
+`REEFY_LLM_PROXY_DEBUG` env said at boot.
+
+Cleanup is the operator's responsibility - this is debugging, not
+telemetry. Delete files manually when you're done.
 
 ## Security model
 

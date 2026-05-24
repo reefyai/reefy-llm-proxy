@@ -23,7 +23,7 @@ import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import codex_translator, providers
+from . import codex_translator, debug, providers
 from .credentials import Credential, CredentialStore
 from .refresh import RefreshError, refresh_credential
 from .registry import ModelRegistry
@@ -293,6 +293,9 @@ async def forward(
     client: httpx.AsyncClient,
 ) -> JSONResponse | StreamingResponse:
     body = await request.body()
+    # Snapshot the raw inbound body BEFORE codex/ChatCompletions
+    # translation rewrites `body` - the debug dump needs both shapes.
+    inbound_body_for_debug = body
     model = ''
     parsed: dict | None = None
     if body:
@@ -433,6 +436,24 @@ async def forward(
     else:
         stream_gen = _stream_with_stats(response, provider_slug, bare_model)
         media_type = resp_headers.get('content-type')
+
+    # Tee the response stream into the debug capture file when the
+    # flag is on. Cost in off-mode is one boolean check; on-mode adds
+    # one list.append + b''.join per request - cheap relative to the
+    # upstream HTTP. Toggle at runtime via /internal/debug.
+    if debug.enabled:
+        stream_gen = debug.wrap_response_stream(
+            stream_gen,
+            method=request.method,
+            inbound_path=request.url.path,
+            inbound_body=inbound_body_for_debug,
+            provider=provider_slug,
+            upstream_url=upstream_url,
+            upstream_body=body,
+            upstream_headers=fwd_headers,
+            response_status=response.status_code,
+            response_headers=resp_headers,
+        )
 
     return StreamingResponse(
         stream_gen,

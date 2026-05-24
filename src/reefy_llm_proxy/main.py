@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from watchfiles import Change, awatch
 
-from . import config
+from . import config, debug
 from .credentials import CredentialStore
 from .proxy import forward
 from .registry import ModelRegistry
@@ -106,6 +106,26 @@ async def internal_stats() -> dict:
     collector lives on the same Docker network as the proxy and the
     network is the access boundary."""
     return stats.snapshot()
+
+
+@app.get('/internal/debug')
+async def get_debug() -> dict:
+    """Inspect the runtime request-dump flag + dump dir.
+
+    Same access model as /internal/stats: no auth, container-network
+    is the boundary. Toggle with POST /internal/debug."""
+    return {'enabled': debug.enabled, 'dump_dir': str(debug.dump_dir)}
+
+
+@app.post('/internal/debug')
+async def set_debug(req: Request) -> dict:
+    """Flip request capture on/off without restarting. Body:
+    `{"enabled": true|false}`. Persists only until the process
+    restarts; for permanent-on set REEFY_LLM_PROXY_DEBUG=1 in the
+    container env."""
+    body = await req.json()
+    debug.enabled = bool(body.get('enabled'))
+    return {'enabled': debug.enabled, 'dump_dir': str(debug.dump_dir)}
 
 
 @app.get('/v1/models')
