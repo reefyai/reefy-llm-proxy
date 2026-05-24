@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -125,6 +126,124 @@ def log_summary(
     )
 
 
+def _assemble_chat_completions_stream(body: bytes) -> dict | None:
+    """Best-effort assembly of a ChatCompletions SSE stream into a
+    single readable summary. Returns None if the body doesn't look
+    like an SSE stream of chat.completion.chunk events (e.g. a JSON
+    error response or a /v1/messages reply).
+
+    Concatenates `choices[0].delta.content` chunks (assistant text),
+    `delta.reasoning_content` (xAI / o1-style reasoning trace), merges
+    `delta.tool_calls` deltas by index (each call's `function.arguments`
+    is split across many chunks), and surfaces the terminal `usage` +
+    `finish_reason` blocks.
+
+    Output shape:
+      {
+        "text": "<assembled assistant content>",
+        "reasoning": "<assembled reasoning_content, if any>",
+        "tool_calls": [{"id":..., "name":..., "arguments":"..."}],
+        "usage": {...},
+        "finish_reason": "stop|tool_calls|length|...",
+        "chunk_count": int,
+        "errors": [str],   # parse failures (capped)
+      }
+    """
+    try:
+        text = body.decode('utf-8')
+    except UnicodeDecodeError:
+        return None
+    # Non-stream path: a single chat.completion JSON object (no SSE
+    # framing). Just lift the assistant message out as-is so the
+    # operator still gets a "what did the model say" field.
+    stripped = text.lstrip()
+    if stripped.startswith('{') and 'data: {' not in text:
+        try:
+            obj = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        choices = obj.get('choices') or []
+        if not choices:
+            return None
+        msg = (choices[0] or {}).get('message') or {}
+        return {
+            'text': msg.get('content') or '',
+            'reasoning': msg.get('reasoning_content') or '',
+            'tool_calls': [{
+                'id': tc.get('id'),
+                'name': (tc.get('function') or {}).get('name'),
+                'arguments': (tc.get('function') or {}).get('arguments', ''),
+            } for tc in msg.get('tool_calls') or []],
+            'usage': obj.get('usage'),
+            'finish_reason': choices[0].get('finish_reason'),
+            'chunk_count': 0,    # non-stream
+        }
+    if 'data: {' not in text:
+        return None
+
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_calls: dict[int, dict] = {}
+    usage: dict | None = None
+    finish_reason: str | None = None
+    chunk_count = 0
+    errors: list[str] = []
+    _ERR_CAP = 5
+
+    for line in text.splitlines():
+        if not line.startswith('data: '):
+            continue
+        payload = line[len('data: '):].strip()
+        if not payload or payload == '[DONE]':
+            continue
+        try:
+            evt = json.loads(payload)
+        except json.JSONDecodeError as e:
+            if len(errors) < _ERR_CAP:
+                errors.append(f'json: {e.msg}')
+            continue
+        chunk_count += 1
+        for choice in evt.get('choices') or []:
+            delta = choice.get('delta') or {}
+            content = delta.get('content')
+            if isinstance(content, str) and content:
+                content_parts.append(content)
+            reasoning = delta.get('reasoning_content')
+            if isinstance(reasoning, str) and reasoning:
+                reasoning_parts.append(reasoning)
+            for tc in delta.get('tool_calls') or []:
+                # ChatCompletions streams tool calls by `index`; the
+                # first event for a call carries id/type/name, later
+                # events carry arguments deltas only.
+                idx = tc.get('index', 0)
+                slot = tool_calls.setdefault(idx, {
+                    'id': None, 'name': None, 'arguments': '',
+                })
+                if tc.get('id'):
+                    slot['id'] = tc['id']
+                fn = tc.get('function') or {}
+                if fn.get('name'):
+                    slot['name'] = fn['name']
+                if isinstance(fn.get('arguments'), str):
+                    slot['arguments'] += fn['arguments']
+            if choice.get('finish_reason'):
+                finish_reason = choice['finish_reason']
+        if isinstance(evt.get('usage'), dict):
+            usage = evt['usage']
+
+    result: dict = {
+        'text': ''.join(content_parts),
+        'reasoning': ''.join(reasoning_parts),
+        'tool_calls': [tool_calls[k] for k in sorted(tool_calls)],
+        'usage': usage,
+        'finish_reason': finish_reason,
+        'chunk_count': chunk_count,
+    }
+    if errors:
+        result['errors'] = errors
+    return result
+
+
 def dump_request_response(
     *,
     method: str,
@@ -165,6 +284,14 @@ def dump_request_response(
             'body_bytes': len(response_body),
         },
     }
+    # Walk the raw SSE chunks ONCE here and surface a concatenated
+    # text + tool-call summary alongside. Saves the operator from
+    # scrolling through hundreds of one-token chunks just to read what
+    # the model actually said. None when the body isn't recognisable
+    # chat-completions SSE (e.g. error JSON, non-stream response).
+    assembled = _assemble_chat_completions_stream(response_body)
+    if assembled is not None:
+        payload['response']['assembled'] = assembled
     return _write_dump(filename, payload)
 
 
