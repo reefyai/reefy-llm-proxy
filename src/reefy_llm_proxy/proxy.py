@@ -322,6 +322,21 @@ async def forward(
                 opts['include_usage'] = True
                 parsed['stream_options'] = opts
                 changed = True
+        # Codex /responses backend rejects requests without stream:true
+        # or with store!=false (400 Bad Request). Inject both - clients
+        # that already set them are no-ops; clients that didn't (hermes
+        # in some flows, openclaw before its codex adapter wires this
+        # in) now succeed.
+        if (
+            provider_slug == 'codex'
+            and path.endswith('responses')
+        ):
+            if parsed.get('stream') is not True:
+                parsed['stream'] = True
+                changed = True
+            if parsed.get('store') is not False:
+                parsed['store'] = False
+                changed = True
         if changed:
             body = json.dumps(parsed).encode('utf-8')
 
