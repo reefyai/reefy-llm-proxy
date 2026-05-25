@@ -92,7 +92,9 @@ back to an official billable API key (`console.x.ai` /
 - `GET  /healthz` - liveness probe.
 - `GET  /internal/stats` - request + token counters (per
   provider/model, prompt vs completion split), for polling
-  collectors.
+  collectors. Consumed by Reefy's per-device metrics page when
+  the proxy ships as part of a fleet device; see
+  [Reefy fleet integration](#reefy-fleet-integration).
 - `GET  /internal/debug`  - inspect the request-capture flag.
 - `POST /internal/debug`  - flip request capture on/off without
   restarting. See [Debug capture](#debug-capture) below.
@@ -165,6 +167,19 @@ stream end. Restarting the container reverts to whatever the
 
 Cleanup is the operator's responsibility - this is debugging, not
 telemetry. Delete files manually when you're done.
+
+## Reefy fleet integration
+
+The proxy ships as part of [Reefy](https://reefy.ai) devices. The
+device's metrics publisher polls `GET /internal/stats` and the
+Reefy dashboard renders per-model request and token series
+(prompt vs completion broken out), time-ranged across
+15m / 1h / 24h / 7d / 30d.
+
+![Reefy.ai per-device LLM metrics panel](docs/reefy-llm-metrics.png)
+
+*Example: AI agent periodic activity (heartbeat) visible as the
+steady stair-step in requests and tokens over 24h.*
 
 ## Security model
 
