@@ -126,6 +126,99 @@ def log_summary(
     )
 
 
+def _assemble_responses_api_stream(text: str) -> dict:
+    """Assemble an OpenAI Responses API SSE stream.
+
+    Event shape (each frame is `event: TYPE\\ndata: {...}\\n\\n`):
+      - response.created                       : ignore
+      - response.output_text.delta             : append `delta` to text
+      - response.reasoning_text.delta          : append `delta` to reasoning
+      - response.output_item.added             : if item.type=function_call,
+        seed a tool slot (id, name) keyed by item_id
+      - response.function_call_arguments.delta : append `delta` to that
+        item_id's arguments
+      - response.completed                     : final response object
+        carries `usage` + a `status` we surface as finish_reason
+
+    Single-shape output matches _assemble_chat_completions_stream so the
+    dump consumer doesn't have to branch on protocol.
+    """
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_calls: dict[str, dict] = {}
+    tool_order: list[str] = []
+    usage: dict | None = None
+    finish_reason: str | None = None
+    chunk_count = 0
+    errors: list[str] = []
+    _ERR_CAP = 5
+
+    for line in text.splitlines():
+        # Responses API frames carry both `event: T` and `data: {...}`.
+        # We only need the JSON; `type` inside the payload mirrors `event:`.
+        if not line.startswith('data: '):
+            continue
+        payload = line[len('data: '):].strip()
+        if not payload or payload == '[DONE]':
+            continue
+        try:
+            evt = json.loads(payload)
+        except json.JSONDecodeError as e:
+            if len(errors) < _ERR_CAP:
+                errors.append(f'json: {e.msg}')
+            continue
+        chunk_count += 1
+        etype = evt.get('type') or ''
+        if etype == 'response.output_text.delta':
+            delta = evt.get('delta')
+            if isinstance(delta, str):
+                content_parts.append(delta)
+        elif etype == 'response.reasoning_text.delta':
+            delta = evt.get('delta')
+            if isinstance(delta, str):
+                reasoning_parts.append(delta)
+        elif etype == 'response.output_item.added':
+            item = evt.get('item') or {}
+            if item.get('type') == 'function_call':
+                key = item.get('id') or item.get('call_id') or f'_{len(tool_order)}'
+                if key not in tool_calls:
+                    tool_order.append(key)
+                tool_calls[key] = {
+                    'id':   item.get('call_id') or item.get('id'),
+                    'name': item.get('name'),
+                    'arguments': item.get('arguments') or '',
+                }
+        elif etype == 'response.function_call_arguments.delta':
+            key = evt.get('item_id') or evt.get('id')
+            delta = evt.get('delta')
+            if key and isinstance(delta, str):
+                slot = tool_calls.setdefault(key, {
+                    'id': key, 'name': None, 'arguments': '',
+                })
+                if key not in tool_order:
+                    tool_order.append(key)
+                slot['arguments'] += delta
+        elif etype == 'response.completed':
+            resp = evt.get('response') or {}
+            if isinstance(resp.get('usage'), dict):
+                usage = resp['usage']
+            # status: completed / failed / incomplete - close enough to a
+            # ChatCompletions finish_reason for the dump.
+            finish_reason = resp.get('status') or finish_reason
+
+    result: dict = {
+        'text': ''.join(content_parts),
+        'reasoning': ''.join(reasoning_parts),
+        'tool_calls': [tool_calls[k] for k in tool_order],
+        'usage': usage,
+        'finish_reason': finish_reason,
+        'chunk_count': chunk_count,
+    }
+    if errors:
+        result['errors'] = errors
+    return result
+
+
 def _assemble_chat_completions_stream(body: bytes) -> dict | None:
     """Best-effort assembly of a ChatCompletions SSE stream into a
     single readable summary. Returns None if the body doesn't look
@@ -180,6 +273,15 @@ def _assemble_chat_completions_stream(body: bytes) -> dict | None:
         }
     if 'data: {' not in text:
         return None
+
+    # Responses API streams (used by /v1/responses callers, including
+    # Hermes when it opts into the codex-responses adapter) use
+    # `event: response.*` framing and `type:` discriminators per data
+    # frame - completely different shape from ChatCompletions chunks.
+    # Detect cheaply by the event prefix and route to the dedicated
+    # parser so the dump shows the assembled text instead of empties.
+    if 'event: response.' in text or '"type":"response.' in text:
+        return _assemble_responses_api_stream(text)
 
     content_parts: list[str] = []
     reasoning_parts: list[str] = []

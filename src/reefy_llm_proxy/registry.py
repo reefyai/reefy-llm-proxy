@@ -45,7 +45,11 @@ class ModelRegistry:
         self._ttl_s = ttl_s
         self._store = store
         self._client = client
-        # {provider: {"fetched_at": int, "models": [str, ...]}}
+        # {provider: {"fetched_at": int, "models": [dict, ...]}}
+        # Stores the FULL upstream model entry so /v1/models can pass
+        # context_window/pricing/modalities through to downstream
+        # clients (Hermes auto-detects context_length this way; no
+        # hardcoded table required).
         self._cache: dict[str, dict] = {}
         self._fetch_lock = asyncio.Lock()
         self._load_from_disk()
@@ -58,10 +62,29 @@ class ModelRegistry:
         except (json.JSONDecodeError, OSError) as e:
             log.warning('models cache %s unreadable: %s', self._cache_file, e)
             return
-        if isinstance(raw, dict):
-            self._cache = raw
+        if not isinstance(raw, dict):
+            return
+        # Migrate older cache files that stored {models: [str, ...]} to
+        # the new {models: [dict, ...]} shape - dropping them forces a
+        # refresh on the next /v1/models call rather than serving a
+        # half-populated response with only `id`.
+        migrated: dict[str, dict] = {}
+        dropped = 0
+        for slug, entry in raw.items():
+            if not isinstance(entry, dict):
+                continue
+            models = entry.get('models')
+            if isinstance(models, list) and all(isinstance(m, dict) for m in models):
+                migrated[slug] = entry
+            else:
+                dropped += 1
+        self._cache = migrated
+        if dropped:
+            log.info('dropped %d legacy str-only provider entr(ies) from cache; '
+                     'will refresh on next request', dropped)
+        if migrated:
             log.info('seeded models cache with %d provider(s) from disk',
-                     len(raw))
+                     len(migrated))
 
     def _persist_to_disk(self) -> None:
         self._cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -82,7 +105,10 @@ class ModelRegistry:
             except OSError:
                 pass
 
-    async def _fetch_one(self, slug: str) -> list[str] | None:
+    async def _fetch_one(self, slug: str) -> list[dict] | None:
+        """Return the full upstream model dicts (not just IDs) so the
+        registry can pass through context_window, pricing, modalities,
+        and any other field downstream clients care about."""
         spec = providers.get(slug)
         if spec is None:
             return None
@@ -118,8 +144,12 @@ class ModelRegistry:
         data = body.get(spec.models_list_key)
         if not isinstance(data, list):
             return None
-        ids = [m.get(spec.model_id_key) for m in data if isinstance(m, dict)]
-        return [m for m in ids if isinstance(m, str)]
+        # Keep the full dict per model. Drop entries with no usable id
+        # (those would be unroutable anyway).
+        return [
+            m for m in data
+            if isinstance(m, dict) and isinstance(m.get(spec.model_id_key), str)
+        ]
 
     async def _maybe_refresh(self) -> None:
         """Refresh stale provider entries (>TTL old) in-place. Holds
@@ -153,17 +183,34 @@ class ModelRegistry:
 
     async def list_for_api(self) -> list[dict]:
         """Return the union of all providers' models, formatted for
-        /v1/models response. Each entry is prefixed with the provider
-        slug."""
+        /v1/models response.
+
+        Pass-through of upstream fields with three normalisations:
+          1. `id`        - prefixed with the provider slug so routing
+                           is unambiguous downstream.
+          2. `object`    - forced to "model" per OpenAI spec.
+          3. `owned_by`  - set to the provider slug.
+        Any upstream field already present (context_window, pricing,
+        input_modalities, display_name, supports_*, ...) is preserved
+        verbatim so downstream clients can auto-detect capabilities
+        without us maintaining a metadata table.
+        """
         await self._maybe_refresh()
         out: list[dict] = []
         for slug, entry in self._cache.items():
-            for model_id in entry.get('models', []):
-                out.append({
-                    'id':       f'{slug}/{model_id}',
-                    'object':   'model',
-                    'owned_by': slug,
-                })
+            spec = providers.get(slug)
+            id_key = spec.model_id_key if spec else 'id'
+            for upstream in entry.get('models', []):
+                if not isinstance(upstream, dict):
+                    continue
+                bare_id = upstream.get(id_key)
+                if not isinstance(bare_id, str):
+                    continue
+                merged = dict(upstream)
+                merged['id'] = f'{slug}/{bare_id}'
+                merged['object'] = 'model'
+                merged['owned_by'] = slug
+                out.append(merged)
         return out
 
     async def resolve_provider(self, model: str) -> str | None:
@@ -181,10 +228,14 @@ class ModelRegistry:
             slug = slug.split('@', 1)[0]
             return slug if providers.get(slug) is not None else None
         await self._maybe_refresh()
-        matches = [
-            slug for slug, entry in self._cache.items()
-            if model in entry.get('models', [])
-        ]
+        matches = []
+        for slug, entry in self._cache.items():
+            spec = providers.get(slug)
+            id_key = spec.model_id_key if spec else 'id'
+            for m in entry.get('models', []):
+                if isinstance(m, dict) and m.get(id_key) == model:
+                    matches.append(slug)
+                    break
         if len(matches) == 1:
             return matches[0]
         return None
