@@ -17,6 +17,7 @@ Flow per inbound /v1/{path}:
 import base64
 import json
 import logging
+import time
 from typing import AsyncIterator
 
 import httpx
@@ -284,6 +285,47 @@ async def _forward_once(
         _do, label=f'forward[{cred.provider}]')
 
 
+# Refresh access_token if it expires within this many seconds. Covers
+# clock skew between proxy and provider + the in-flight request RTT.
+# Too small: requests in the last few seconds of validity still 401/403.
+# Too large: pointless early-rotation; fine to err on the safe side.
+_TOKEN_EXPIRY_SKEW_S = 60
+
+
+async def _ensure_fresh(
+    client: httpx.AsyncClient,
+    store: 'CredentialStore',
+    cred: Credential,
+) -> Credential:
+    """Return a credential whose access_token won't expire within the
+    next _TOKEN_EXPIRY_SKEW_S seconds. If the input is already fresh,
+    returns it unchanged (one int compare). Otherwise grabs the per-
+    (provider, label) lock, double-checks under the lock (in case
+    another coroutine just rotated), and runs `refresh_credential`.
+
+    On refresh error, returns the original (stale) cred and lets the
+    caller's upstream call surface the auth failure - that matches
+    the existing behaviour for refresh-failed-in-flight (caller gets
+    a 401/403 and the reactive path either retries or bubbles up).
+    """
+    if cred.expires_at - time.time() > _TOKEN_EXPIRY_SKEW_S:
+        return cred
+    lock = store.lock_for(cred.provider, cred.label)
+    async with lock:
+        current = store.get(cred.provider, cred.label) or cred
+        # Another coroutine may have refreshed while we waited.
+        if current.expires_at - time.time() > _TOKEN_EXPIRY_SKEW_S:
+            return current
+        try:
+            return await refresh_credential(client, store, current)
+        except RefreshError as e:
+            log.warning(
+                'proactive refresh failed for %s: %s; passing through '
+                'with stale token (reactive 401/403 path may still recover)',
+                current.provider, e)
+            return current
+
+
 async def forward(
     request: Request,
     path: str,
@@ -383,6 +425,18 @@ async def forward(
             body = json.dumps(parsed).encode('utf-8')
 
     upstream_url = f'{spec.base_url.rstrip("/")}/{path.lstrip("/")}'
+
+    # Proactive refresh: if the access_token is at/past expiry (with a
+    # 60s skew for clock drift + the request RTT itself), refresh it
+    # in-place BEFORE the upstream call. Cheap when not stale (one
+    # int compare); critical correctness when stale (xAI returns 403
+    # not 401 for expired tokens, so the reactive path below is the
+    # only catch for codex - and we'd rather not even depend on it).
+    # Caught 2026-05-26 when an xai token sat 18h expired in the
+    # store without a single refresh attempt; OAuth2 best practice
+    # is "refresh ahead of expiry", not "wait for an error".
+    cred = await _ensure_fresh(client, store, cred)
+
     fwd_headers = _filter_request_headers(dict(request.headers))
     # Provider-specific headers override anything the client passed.
     # For codex this carries the Cloudflare-required originator + a
@@ -395,27 +449,37 @@ async def forward(
         client, request.method, upstream_url, fwd_headers, body, cred,
         params=spec.extra_query_params or None)
 
-    # 401 -> refresh + retry once.
-    if response.status_code == 401:
-        await response.aclose()
-        lock = store.lock_for(cred.provider, cred.label)
-        async with lock:
-            current = store.get(cred.provider, cred.label) or cred
-            if current.access_token == cred.access_token:
-                try:
-                    cred = await refresh_credential(client, store, current)
-                except RefreshError as e:
-                    log.error('refresh failed for %s: %s', cred.provider, e)
-                    return _err(
-                        401,
-                        f"refresh failed for '{cred.provider}': "
-                        f"{'re-attach required' if e.permanent else 'transient; try again'}"
-                    )
-            else:
-                cred = current     # someone else refreshed while we waited
-        response = await _forward_once(
-            client, request.method, upstream_url, fwd_headers, body, cred,
-            params=spec.extra_query_params or None)
+    # Reactive safety net: 401 (codex shape) OR 403 (xAI shape) ->
+    # refresh + retry once. Anti-flood guard: if we JUST refreshed
+    # (proactive or last reactive call), don't loop; the upstream is
+    # rejecting for a non-auth reason (model unavailable, account
+    # suspended, rate limit) and a fresh token won't help.
+    if response.status_code in (401, 403):
+        just_refreshed = (cred.last_refreshed_at is not None
+                          and time.time() - cred.last_refreshed_at < 30)
+        if not just_refreshed:
+            await response.aclose()
+            lock = store.lock_for(cred.provider, cred.label)
+            async with lock:
+                current = store.get(cred.provider, cred.label) or cred
+                if current.access_token == cred.access_token:
+                    try:
+                        cred = await refresh_credential(client, store, current)
+                    except RefreshError as e:
+                        log.error('refresh failed for %s: %s', cred.provider, e)
+                        return _err(
+                            401,
+                            f"refresh failed for '{cred.provider}': "
+                            f"{'re-attach required' if e.permanent else 'transient; try again'}"
+                        )
+                else:
+                    cred = current     # someone else refreshed while we waited
+            # Recompute provider headers (codex's ChatGPT-Account-ID
+            # is derived from the JWT, which changes on refresh).
+            fwd_headers.update(_provider_headers(spec, cred))
+            response = await _forward_once(
+                client, request.method, upstream_url, fwd_headers, body, cred,
+                params=spec.extra_query_params or None)
 
     bare_model = _strip_model_prefix(model) if model else ''
     if response.status_code < 400 and bare_model:
