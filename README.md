@@ -4,6 +4,8 @@ Device-side OpenAI-compatible gateway that lets apps use **subscription-based
 LLM accounts** (xAI Grok, OpenAI Codex) - fixed monthly cost, no
 per-token billing surprises - through standard OpenAI client SDKs.
 
+![AI agents (OpenClaw, Hermes) call the Reefy LLM Proxy over an OpenAI-compatible HTTP API; the proxy fronts OAuth-subscription LLM providers (OpenAI, xAI)](docs/architecture.png)
+
 The proxy handles the OAuth subscription dance under the hood: it
 stores credentials produced by a device-code OAuth flow, refreshes
 access_tokens lazily when upstream returns 401, persists rotated
