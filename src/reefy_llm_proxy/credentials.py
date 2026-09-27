@@ -8,6 +8,7 @@ semantics.
 
 import asyncio
 import json
+import hashlib
 import logging
 import os
 import tempfile
@@ -140,10 +141,9 @@ class CredentialStore:
         if not isinstance(runtime_seed, dict):
             runtime_seed = {}
 
-        # Edge case: no attach file at all. Best-effort fallback to
-        # runtime (operator may have deleted attach intentionally;
-        # the proxy can still serve until the chain breaks).
-        if not attach_providers:
+        # Only a missing/unreadable attach file permits legacy runtime fallback.
+        # An explicit {"providers": {}} is authoritative detachment, not absence.
+        if attach_raw is None:
             if runtime_providers:
                 self._vault = Vault(providers=runtime_providers)
                 self._chain_seed = {
@@ -220,6 +220,18 @@ class CredentialStore:
 
     def get(self, provider: str, label: str = 'default') -> Credential | None:
         return self._vault.providers.get(_key(provider, label))
+
+    def discovery_identity(self, provider: str) -> str | None:
+        """Opaque cache binding to the attached account, stable across rotation.
+
+        No credential value is stored in model cache files. Reattaching a new
+        refresh-token chain invalidates the old account's discovery result.
+        """
+        cred = self.get(provider)
+        if cred is None:
+            return None
+        seed = self._chain_seed.get(_key(provider)) or cred.refresh_token or cred.access_token
+        return hashlib.sha256(seed.encode()).hexdigest()
 
     def lock_for(self, provider: str, label: str = 'default') -> asyncio.Lock:
         key = _key(provider, label)

@@ -318,7 +318,7 @@ overrides:
    validity. We send:
 
    ```
-   User-Agent:           codex_cli_rs/0.21.0 (reefy-llm-proxy)
+   User-Agent:           codex_cli_rs/0.155.0-alpha.9.2 (reefy-llm-proxy)
    originator:           codex_cli_rs
    ChatGPT-Account-ID:   <extracted from JWT claim>
    ```
@@ -377,3 +377,14 @@ curl -X POST http://localhost:9080/v1/chat/completions \
 CI builds on push to `main` via `.github/workflows/build.yml`,
 publishing `ghcr.io/reefyai/reefy-llm-proxy:sha-<short-sha>` and
 `:latest`.
+
+
+## Model-discovery regression E2E
+
+Run on Linux with the normal dependencies installed:
+
+```sh
+PYTHONPATH=src E2E_ARTIFACT_DIR=artifacts/e2e python -m unittest discover -s tests/e2e -v
+```
+
+The suite starts real HTTP proxy/upstream servers, exercises FastAPI startup, the credential-file watcher and persisted caches, and uses synthetic credentials. It makes no external provider calls. CI runs it before publishing an image and saves sanitized request/response evidence even on failure. See [the reproduction and fix](docs/model-discovery-regression.md).

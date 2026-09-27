@@ -5,13 +5,36 @@ on:
     branches:
       - main
   workflow_dispatch:
+  pull_request:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - name: HTTP model discovery E2E
+        env:
+          PYTHONPATH: src
+          E2E_ARTIFACT_DIR: artifacts/e2e
+        run: python -m unittest discover -s tests/e2e -v
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: model-discovery-e2e
+          path: artifacts/e2e
   build-push:
+    needs: test
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,7 +61,7 @@ jobs:
           push: true
           tags: |
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.sha_tag }}
-            ${{ steps.meta.outputs.image }}:latest
+            ${{ github.ref == 'refs/heads/main' && format('{0}:latest', steps.meta.outputs.image) || '' }}
           provenance: false
           cache-from: type=registry,ref=${{ steps.meta.outputs.image }}:buildcache
           cache-to: type=registry,ref=${{ steps.meta.outputs.image }}:buildcache,mode=max
