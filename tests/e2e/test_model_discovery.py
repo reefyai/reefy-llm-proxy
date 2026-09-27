@@ -55,6 +55,25 @@ class DiscoveryE2E(unittest.IsolatedAsyncioTestCase):
                 return {'models': [] if self.empty or (self.gate_version and version != SUPPORTED_VERSION) else [{'slug': name, 'context_window': 123456}]}
             return {'data': [{'id': 'grok-fixture'}]}
 
+        @upstream.post('/codex/responses')
+        async def completion(request: Request):
+            from fastapi.responses import JSONResponse, StreamingResponse
+            body = await request.json()
+            self.requests.append(body)
+            if 'temperature' in body or 'top_p' in body:
+                return JSONResponse({'detail': 'Unsupported parameter: temperature'}, status_code=400)
+            events = [
+                {'type': 'response.output_text.delta', 'delta': 'Ready'},
+                {'type': 'response.output_item.added', 'item': {'type': 'function_call', 'id': 'fc1', 'call_id': 'call1', 'name': 'lookup'}},
+                {'type': 'response.function_call_arguments.delta', 'item_id': 'fc1', 'delta': '{"q":'},
+                {'type': 'response.function_call_arguments.delta', 'item_id': 'fc1', 'delta': '"test"}'},
+                {'type': 'response.completed', 'response': {'usage': {'input_tokens': 8, 'output_tokens': 4, 'total_tokens': 12}}},
+            ]
+            async def stream():
+                for event in events:
+                    yield ('data: ' + json.dumps(event) + '\n\n').encode()
+            return StreamingResponse(stream(), media_type='text/event-stream')
+
         base = await self.start_server(upstream)
         for slug, spec in self.original_specs.items():
             providers.PROVIDERS[slug] = dataclasses.replace(spec, base_url=f'{base}/{slug}')
@@ -210,6 +229,30 @@ class DiscoveryE2E(unittest.IsolatedAsyncioTestCase):
         await self.proxy()
         self.assertEqual(await self.models(), ['codex/gpt-fixture'])
         self.assertEqual(len(self.requests), 1)
+
+    async def test_codex_nonstream_chat_with_sampling_and_tools(self):
+        self.attach(['codex'])
+        await self.proxy()
+        response = await self.client.post(self.base + '/v1/chat/completions', json={
+            'model': 'codex/gpt-fixture', 'messages': [{'role': 'user', 'content': 'Hello'}],
+            'temperature': 0.2, 'top_p': 0.9, 'stream': False,
+            'tools': [{'type': 'function', 'function': {'name': 'lookup', 'parameters': {'type': 'object'}}}]})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn('application/json', response.headers['content-type'])
+        body = response.json()
+        self.assertEqual(body['choices'][0]['message']['content'], 'Ready')
+        self.assertEqual(body['choices'][0]['message']['tool_calls'][0]['function']['arguments'], '{"q":"test"}')
+        self.assertEqual(body['choices'][0]['finish_reason'], 'tool_calls')
+        self.assertEqual(body['usage']['total_tokens'], 12)
+
+    async def test_codex_stream_chat_preserves_sse(self):
+        self.attach(['codex'])
+        await self.proxy()
+        response = await self.client.post(self.base + '/v1/chat/completions', json={
+            'model': 'codex/gpt-fixture', 'messages': [{'role': 'user', 'content': 'Hello'}], 'stream': True})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('text/event-stream', response.headers['content-type'])
+        self.assertIn('data: [DONE]', response.text)
 
 
 if __name__ == '__main__':

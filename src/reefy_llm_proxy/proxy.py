@@ -377,6 +377,7 @@ async def forward(
     # response side gets re-translated back to ChatCompletions chunks
     # below so the client sees what it expected.
     translate_codex_response = False
+    codex_client_stream = True
     if (provider_slug == 'codex'
             and path.endswith('chat/completions')
             and parsed is not None):
@@ -384,6 +385,7 @@ async def forward(
         # bare model.
         if model:
             parsed['model'] = _strip_model_prefix(model)
+        codex_client_stream = parsed.get('stream') is True
         parsed = codex_translator.chat_to_responses(parsed)
         body = json.dumps(parsed).encode('utf-8')
         path = 'responses'
@@ -518,6 +520,14 @@ async def forward(
             response_status=response.status_code,
             response_headers=resp_headers,
         )
+
+    if translate_codex_response and response.status_code < 400 and not codex_client_stream:
+        try:
+            result = await codex_translator.collect_chat_sse(stream_gen)
+        except (ValueError, httpx.HTTPError):
+            return JSONResponse({'error': {'message': 'Codex response was incomplete', 'type': 'upstream_error'}}, status_code=502)
+        headers = {k: v for k, v in resp_headers.items() if k.lower() not in ('content-type', 'content-length')}
+        return JSONResponse(result, headers=headers)
 
     return StreamingResponse(
         stream_gen,
