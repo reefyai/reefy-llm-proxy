@@ -90,7 +90,10 @@ back to an official billable API key (`console.x.ai` /
 - `GET  /v1/models` - union of `/v1/models` from each attached
   provider, prefixed with the provider slug (e.g. `xai/grok-4`,
   `codex/gpt-4o`). Cached with a 24h TTL; falls back to the last
-  successful fetch if upstream is down.
+  successful fetch if upstream is down. Disconnected providers are
+  removed from discovery and bare-name routing on the next lookup.
+  Changes to upstream catalog query parameters invalidate the TTL,
+  including upgrading the Codex client version.
 - `GET  /healthz` - liveness probe.
 - `GET  /internal/stats` - request + token counters (per
   provider/model, prompt vs completion split), for polling
@@ -318,7 +321,7 @@ overrides:
    validity. We send:
 
    ```
-   User-Agent:           codex_cli_rs/0.21.0 (reefy-llm-proxy)
+   User-Agent:           codex_cli_rs/0.134.0 (reefy-llm-proxy)
    originator:           codex_cli_rs
    ChatGPT-Account-ID:   <extracted from JWT claim>
    ```
@@ -356,6 +359,7 @@ overrides:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+PYTHONPATH=src python -m unittest discover -s tests -v
 
 mkdir -p /tmp/reefy-llm-proxy-data
 # place a credentials.json with valid tokens here for live testing

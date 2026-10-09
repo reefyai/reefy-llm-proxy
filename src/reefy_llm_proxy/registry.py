@@ -45,7 +45,7 @@ class ModelRegistry:
         self._ttl_s = ttl_s
         self._store = store
         self._client = client
-        # {provider: {"fetched_at": int, "models": [dict, ...]}}
+        # {provider: {"fetched_at": int, "models": [dict, ...], "query_params": dict}}
         # Stores the FULL upstream model entry so /v1/models can pass
         # context_window/pricing/modalities through to downstream
         # clients (Hermes auto-detects context_length this way; no
@@ -119,7 +119,8 @@ class ModelRegistry:
         async def _get() -> httpx.Response:
             return await self._client.get(
                 f'{spec.base_url}/models',
-                headers={'Authorization': f'Bearer {cred.access_token}'},
+                headers={**spec.extra_headers,
+                         'Authorization': f'Bearer {cred.access_token}'},
                 params=spec.extra_query_params or None,
             )
 
@@ -156,11 +157,22 @@ class ModelRegistry:
         one lock; concurrent callers wait."""
         async with self._fetch_lock:
             now = int(time.time())
+            # A detached provider is no longer available, even if its
+            # last successful catalog is still fresh or loaded from disk.
+            detached = [slug for slug in self._cache
+                        if providers.get(slug) is None
+                        or self._store.get(slug) is None]
+            for slug in detached:
+                del self._cache[slug]
+            if detached:
+                self._persist_to_disk()
             stale = [
                 slug for slug in providers.known_slugs()
                 if (self._store.get(slug) is not None
-                    and now - int(self._cache.get(slug, {}).get('fetched_at', 0))
-                        > self._ttl_s)
+                    and (now - int(self._cache.get(slug, {}).get('fetched_at', 0))
+                         > self._ttl_s
+                         or self._cache.get(slug, {}).get('query_params', {})
+                         != providers.get(slug).extra_query_params))
             ]
             if not stale:
                 return
@@ -170,10 +182,17 @@ class ModelRegistry:
             )
             dirty = False
             for slug, result in zip(stale, results):
+                # Credentials can be reloaded while the fetch is in flight.
+                if self._store.get(slug) is None:
+                    if slug in self._cache:
+                        del self._cache[slug]
+                        dirty = True
+                    continue
                 if isinstance(result, list):
                     self._cache[slug] = {
                         'fetched_at': now,
                         'models': result,
+                        'query_params': dict(providers.get(slug).extra_query_params),
                     }
                     dirty = True
                 # On failure: keep whatever's already in self._cache[slug]
@@ -198,6 +217,8 @@ class ModelRegistry:
         await self._maybe_refresh()
         out: list[dict] = []
         for slug, entry in self._cache.items():
+            if self._store.get(slug) is None:
+                continue
             spec = providers.get(slug)
             id_key = spec.model_id_key if spec else 'id'
             for upstream in entry.get('models', []):
@@ -230,6 +251,8 @@ class ModelRegistry:
         await self._maybe_refresh()
         matches = []
         for slug, entry in self._cache.items():
+            if self._store.get(slug) is None:
+                continue
             spec = providers.get(slug)
             id_key = spec.model_id_key if spec else 'id'
             for m in entry.get('models', []):

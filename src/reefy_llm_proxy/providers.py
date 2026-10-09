@@ -49,6 +49,8 @@ class ProviderSpec:
 # shape on. Bump in lockstep with the official codex-cli release we
 # track so response fields (e.g. prefer_websockets in /models) match
 # what our parser expects.
+CODEX_CLIENT_VERSION = '0.134.0'
+
 PROVIDERS: dict[str, ProviderSpec] = {
     'xai': ProviderSpec(
         slug='xai',
@@ -61,7 +63,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         base_url='https://chatgpt.com/backend-api/codex',
         token_url='https://auth.openai.com/oauth/token',
         client_id='app_EMoamEEZ73f0CkXaXp7hrann',
-        extra_query_params={'client_version': '0.21.0'},
+        extra_query_params={'client_version': CODEX_CLIENT_VERSION},
         models_list_key='models',
         model_id_key='slug',
         # Cloudflare in front of chatgpt.com/backend-api/codex
@@ -82,7 +84,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         # ChatGPT-Account-ID is dynamic (extracted from the bearer
         # JWT's claims) and injected per-request in proxy.py.
         extra_headers={
-            'User-Agent': 'codex_cli_rs/0.21.0 (reefy-llm-proxy)',
+            'User-Agent': f'codex_cli_rs/{CODEX_CLIENT_VERSION} (reefy-llm-proxy)',
             'originator': 'codex_cli_rs',
         },
     ),
