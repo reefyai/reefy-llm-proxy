@@ -384,6 +384,7 @@ publishing `ghcr.io/reefyai/reefy-llm-proxy:sha-<short-sha>` and
 Run on Linux with the normal dependencies installed:
 
 ```sh
+PYTHONPATH=src python -m unittest discover -s tests -v
 PYTHONPATH=src E2E_ARTIFACT_DIR=artifacts/e2e python -m unittest discover -s tests/e2e -v
 ```
 

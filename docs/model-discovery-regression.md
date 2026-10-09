@@ -34,3 +34,9 @@ PYTHONPATH=src PROXY_LIVE_DISCOVERY=1 PROXY_EXPECT_PROVIDER=codex \
 ```
 
 The active Gputer container received a backed-up source hotfix for `providers.py`, `credentials.py` and `registry.py`; the platform-wide image pin was deliberately not changed. The backup (source, state, and installed-source hashes) is `/mnt/reefy-data/state/llm-proxy-hotfix-backups/20260927-164512-models/` on Gputer. This hotfix survives container restart, but recreation restores the pinned image. A tested candidate image `reefy-llm-proxy:models-fix-20260927` exists locally. Publishing the repository fix and rolling out the corresponding managed image remain necessary for permanent deployment. The CC model selection was not changed automatically.
+
+## Consolidated Coral verification (2026-10-09)
+
+PR #2's focused registry regressions are consolidated into this fix as `tests/test_registry.py`, using the account/configuration cache binding and `0.155.0-alpha.9.2` compatibility version already present here. The existing build workflow runs both registry unit tests and HTTP E2Es before publishing; no second test workflow is needed.
+
+The combined discovery implementation was exercised on Coral in a separate Python process, using the existing attached OpenAI credentials and a temporary copy of its stale xAI/empty Codex cache. It returned ten `codex/...` model entries, removed xAI from the temporary persisted cache, and rejected bare `grok-4.5` routing. The production proxy process and its persistent files were not modified. This GET-only validation does not establish completion compatibility for all discovered models.

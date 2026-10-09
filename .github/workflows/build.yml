@@ -19,6 +19,10 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install -r requirements.txt
+      - name: Model registry regression tests
+        env:
+          PYTHONPATH: src
+        run: python -m unittest discover -s tests -v
       - name: HTTP model discovery E2E
         env:
           PYTHONPATH: src
