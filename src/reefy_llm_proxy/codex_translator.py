@@ -217,10 +217,10 @@ def chat_to_responses(body: dict) -> dict:
                 new_tools.append(t)
         out['tools'] = new_tools
 
-    # tool_choice / parallel_tool_calls / temperature / top_p etc. are
-    # shape-compatible between the two APIs; pass through if present.
+    # Codex rejects temperature/top_p. Use its default sampling policy;
+    # other providers are unaffected by this Codex-only adapter.
     for key in ('tool_choice', 'parallel_tool_calls',
-                'temperature', 'top_p', 'reasoning'):
+                'reasoning'):
         if key in body:
             out[key] = body[key]
 
@@ -349,3 +349,41 @@ async def responses_sse_to_chat_sse(
                     yield make_chunk({}, finish_reason=finish, usage=usage)
 
     yield b'data: [DONE]\n\n'
+
+
+async def collect_chat_sse(stream: AsyncIterator[bytes]) -> dict:
+    """Collect translated chunks for a non-streaming ChatCompletions client.
+
+    Require a terminal event; never turn a truncated provider stream into success.
+    """
+    result = {'object': 'chat.completion'}
+    text = []
+    calls = {}
+    finish = None
+    async for chunk in stream:
+        for line in chunk.splitlines():
+            if not line.startswith(b'data:') or line[5:].strip() == b'[DONE]':
+                continue
+            event = json.loads(line[5:])
+            for key in ('id', 'created', 'model', 'usage'):
+                if key in event:
+                    result[key] = event[key]
+            for choice in event.get('choices', []):
+                delta = choice.get('delta') or {}
+                if delta.get('content'):
+                    text.append(delta['content'])
+                for call in delta.get('tool_calls', []):
+                    saved = calls.setdefault(call['index'], {'type': 'function', 'function': {'name': '', 'arguments': ''}})
+                    if 'id' in call:
+                        saved['id'] = call['id']
+                    for key in ('name', 'arguments'):
+                        saved['function'][key] += call.get('function', {}).get(key, '')
+                if choice.get('finish_reason'):
+                    finish = choice['finish_reason']
+    if finish is None:
+        raise ValueError('Codex stream ended without a completed response')
+    message = {'role': 'assistant', 'content': ''.join(text) or None}
+    if calls:
+        message['tool_calls'] = [calls[i] for i in sorted(calls)]
+    result['choices'] = [{'index': 0, 'message': message, 'finish_reason': finish}]
+    return result

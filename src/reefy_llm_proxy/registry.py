@@ -19,6 +19,7 @@ which is always older than TTL, so it fetches on first access.
 
 import asyncio
 import json
+import hashlib
 import logging
 import os
 import tempfile
@@ -52,6 +53,7 @@ class ModelRegistry:
         # hardcoded table required).
         self._cache: dict[str, dict] = {}
         self._fetch_lock = asyncio.Lock()
+        self._retry_at: dict[str, float] = {}
         self._load_from_disk()
 
     def _load_from_disk(self) -> None:
@@ -119,7 +121,7 @@ class ModelRegistry:
         async def _get() -> httpx.Response:
             return await self._client.get(
                 f'{spec.base_url}/models',
-                headers={'Authorization': f'Bearer {cred.access_token}'},
+                headers={**spec.extra_headers, 'Authorization': f'Bearer {cred.access_token}'},
                 params=spec.extra_query_params or None,
             )
 
@@ -141,6 +143,8 @@ class ModelRegistry:
             log.warning('models[%s]: invalid json', slug)
             return None
 
+        if not isinstance(body, dict):
+            return None
         data = body.get(spec.models_list_key)
         if not isinstance(data, list):
             return None
@@ -151,33 +155,60 @@ class ModelRegistry:
             if isinstance(m, dict) and isinstance(m.get(spec.model_id_key), str)
         ]
 
+    def _context(self, slug: str) -> str | None:
+        identity = self._store.discovery_identity(slug)
+        spec = providers.get(slug)
+        if identity is None or spec is None:
+            return None
+        payload = json.dumps({
+            'schema': 1, 'identity': identity, 'base_url': spec.base_url,
+            'query': spec.extra_query_params, 'headers': spec.extra_headers,
+            'list_key': spec.models_list_key, 'id_key': spec.model_id_key,
+        }, sort_keys=True)
+        return hashlib.sha256(payload.encode()).hexdigest()
+
     async def _maybe_refresh(self) -> None:
-        """Refresh stale provider entries (>TTL old) in-place. Holds
-        one lock; concurrent callers wait."""
+        """Refresh active accounts only; discard results invalidated in flight."""
         async with self._fetch_lock:
-            now = int(time.time())
-            stale = [
-                slug for slug in providers.known_slugs()
-                if (self._store.get(slug) is not None
-                    and now - int(self._cache.get(slug, {}).get('fetched_at', 0))
-                        > self._ttl_s)
-            ]
-            if not stale:
-                return
-            results = await asyncio.gather(
-                *(self._fetch_one(slug) for slug in stale),
-                return_exceptions=True,
-            )
+            now = time.time()
+            contexts = {slug: self._context(slug) for slug in providers.known_slugs()}
             dirty = False
+            for slug in list(self._cache):
+                context = contexts.get(slug)
+                if context is None or self._cache[slug].get('context') != context:
+                    del self._cache[slug]
+                    self._retry_at.pop(slug, None)
+                    dirty = True
+            stale = []
+            for slug, context in contexts.items():
+                if context is None:
+                    self._retry_at.pop(slug, None)
+                    continue
+                entry = self._cache.get(slug, {})
+                # An empty upstream list is valid, but must not hide newly
+                # available models for the normal 24-hour positive-cache TTL.
+                ttl = self._ttl_s if entry.get('models') else min(self._ttl_s, 60)
+                if (not entry or now - entry.get('fetched_at', 0) >= ttl) and now >= self._retry_at.get(slug, 0):
+                    stale.append(slug)
+            results = await asyncio.gather(
+                *(self._fetch_one(slug) for slug in stale), return_exceptions=True)
             for slug, result in zip(stale, results):
+                if contexts[slug] != self._context(slug):
+                    self._cache.pop(slug, None)
+                    self._retry_at.pop(slug, None)
+                    dirty = True
+                    continue
                 if isinstance(result, list):
                     self._cache[slug] = {
-                        'fetched_at': now,
-                        'models': result,
+                        'fetched_at': int(time.time()), 'models': result,
+                        'context': contexts[slug],
                     }
+                    self._retry_at.pop(slug, None)
                     dirty = True
-                # On failure: keep whatever's already in self._cache[slug]
-                # (may be stale or absent). Honest.
+                else:
+                    # Retain last-good data only for this same active account.
+                    # Bound retries during provider outages.
+                    self._retry_at[slug] = time.time() + 30
             if dirty:
                 self._persist_to_disk()
 
@@ -198,6 +229,8 @@ class ModelRegistry:
         await self._maybe_refresh()
         out: list[dict] = []
         for slug, entry in self._cache.items():
+            if self._context(slug) is None or entry.get('context') != self._context(slug):
+                continue
             spec = providers.get(slug)
             id_key = spec.model_id_key if spec else 'id'
             for upstream in entry.get('models', []):
@@ -230,6 +263,8 @@ class ModelRegistry:
         await self._maybe_refresh()
         matches = []
         for slug, entry in self._cache.items():
+            if self._context(slug) is None or entry.get('context') != self._context(slug):
+                continue
             spec = providers.get(slug)
             id_key = spec.model_id_key if spec else 'id'
             for m in entry.get('models', []):
