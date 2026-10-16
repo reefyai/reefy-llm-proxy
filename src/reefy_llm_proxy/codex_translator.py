@@ -235,7 +235,7 @@ async def responses_sse_to_chat_sse(
 
     Codex emits a dozen event types; we care about three groups:
       - response.output_text.delta: text content streaming
-      - response.output_item.added / function_call_arguments.delta:
+      - response.output_item.added / function_call_arguments.delta / done:
         tool-call streaming (split into shape-compatible
         ChatCompletions tool_calls deltas)
       - response.completed: final event with usage + done marker
@@ -275,7 +275,22 @@ async def responses_sse_to_chat_sse(
     # codex's `call_id`. Track both so deltas can be routed by item_id
     # while emitting the call_id to the client.
     tool_call_idx = 0
-    tool_calls: dict[str, dict] = {}   # item_id -> {index, call_id}
+    tool_calls: dict[str, dict] = {}   # item_id -> {index, call_id, arguments}
+
+    def complete_arguments(item_id: str, arguments: str) -> bytes | None:
+        tc = tool_calls.get(item_id)
+        if tc is None:
+            raise ValueError('Completed arguments for an unknown tool call')
+        previous = tc['arguments']
+        if not isinstance(arguments, str) or not arguments.startswith(previous):
+            raise ValueError('Completed tool arguments conflict with streamed arguments')
+        suffix = arguments[len(previous):]
+        tc['arguments'] = arguments
+        if suffix:
+            return make_chunk({'tool_calls': [{
+                'index': tc['index'], 'function': {'arguments': suffix},
+            }]})
+        return None
 
     buf = b''
     async for chunk in upstream:
@@ -309,9 +324,11 @@ async def responses_sse_to_chat_sse(
                         tool_calls[item_id] = {
                             'index': tool_call_idx,
                             'call_id': call_id,
+                            'arguments': item.get('arguments', ''),
                         }
                         # Emit the opening tool_call delta with id + name;
-                        # arguments stream in later as function_call_arguments.delta.
+                        # Arguments can be populated now, streamed, or delivered only
+                        # in a completion event (observed for parallel calls).
                         yield make_chunk({
                             'tool_calls': [{
                                 'index': tool_call_idx,
@@ -319,7 +336,7 @@ async def responses_sse_to_chat_sse(
                                 'type': 'function',
                                 'function': {
                                     'name': item.get('name', ''),
-                                    'arguments': '',
+                                    'arguments': item.get('arguments', ''),
                                 },
                             }],
                         })
@@ -330,6 +347,7 @@ async def responses_sse_to_chat_sse(
                     delta_args = evt.get('delta', '')
                     tc = tool_calls.get(item_id)
                     if tc is not None and delta_args:
+                        tc['arguments'] += delta_args
                         yield make_chunk({
                             'tool_calls': [{
                                 'index': tc['index'],
@@ -337,8 +355,25 @@ async def responses_sse_to_chat_sse(
                             }],
                         })
 
+                elif etype == 'response.function_call_arguments.done':
+                    completed = complete_arguments(evt.get('item_id', ''), evt.get('arguments', ''))
+                    if completed is not None:
+                        yield completed
+
+                elif etype == 'response.output_item.done':
+                    item = evt.get('item') or {}
+                    if item.get('type') == 'function_call':
+                        completed = complete_arguments(item.get('id', ''), item.get('arguments', ''))
+                        if completed is not None:
+                            yield completed
+
                 elif etype == 'response.completed':
                     resp = evt.get('response') or {}
+                    for item in resp.get('output') or []:
+                        if item.get('type') == 'function_call':
+                            completed = complete_arguments(item.get('id', ''), item.get('arguments', ''))
+                            if completed is not None:
+                                yield completed
                     u = resp.get('usage') or {}
                     usage = {
                         'prompt_tokens':     int(u.get('input_tokens', 0)),
