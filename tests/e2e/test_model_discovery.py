@@ -33,6 +33,7 @@ class DiscoveryE2E(unittest.IsolatedAsyncioTestCase):
             setattr(config, key, self.root / filename)
         self.gate_version = False
         self.empty = False
+        self.completed_parallel_tools = False
         self.unavailable = False
         self.hold = False
         self.entered = asyncio.Event()
@@ -69,6 +70,18 @@ class DiscoveryE2E(unittest.IsolatedAsyncioTestCase):
                 {'type': 'response.function_call_arguments.delta', 'item_id': 'fc1', 'delta': '"test"}'},
                 {'type': 'response.completed', 'response': {'usage': {'input_tokens': 8, 'output_tokens': 4, 'total_tokens': 12}}},
             ]
+            if self.completed_parallel_tools:
+                calls = [{'type': 'function_call', 'id': f'item-{i}', 'call_id': f'call-{i}',
+                          'name': 'lookup', 'arguments': json.dumps({'q': value})}
+                         for i, value in enumerate(['alpha', 'beta'])]
+                events = []
+                for call in calls:
+                    events += [
+                        {'type': 'response.output_item.added', 'item': dict(call, arguments='')},
+                        {'type': 'response.function_call_arguments.done', 'item_id': call['id'], 'arguments': call['arguments']},
+                        {'type': 'response.output_item.done', 'item': call},
+                    ]
+                events += [{'type': 'response.completed', 'response': {'output': calls}}]
             async def stream():
                 for event in events:
                     yield ('data: ' + json.dumps(event) + '\n\n').encode()
@@ -244,6 +257,29 @@ class DiscoveryE2E(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body['choices'][0]['message']['tool_calls'][0]['function']['arguments'], '{"q":"test"}')
         self.assertEqual(body['choices'][0]['finish_reason'], 'tool_calls')
         self.assertEqual(body['usage']['total_tokens'], 12)
+
+    async def test_parallel_completion_only_tool_calls_over_http(self):
+        self.attach(['codex'])
+        await self.proxy()
+        self.completed_parallel_tools = True
+        for streaming in [False, True]:
+            response = await self.client.post(self.base + '/v1/chat/completions', json={
+                'model': 'codex/gpt-fixture', 'messages': [{'role': 'user', 'content': 'Look up both'}],
+                'stream': streaming, 'tools': [{'type': 'function', 'function': {
+                    'name': 'lookup', 'parameters': {'type': 'object'}}}]})
+            self.assertEqual(response.status_code, 200, response.text)
+            if streaming:
+                from reefy_llm_proxy.codex_translator import collect_chat_sse
+                async def chunks():
+                    yield response.content
+                body = await collect_chat_sse(chunks())
+            else:
+                body = response.json()
+            calls = body['choices'][0]['message']['tool_calls']
+            self.assertEqual([c['id'] for c in calls], ['call-0', 'call-1'])
+            self.assertEqual([json.loads(c['function']['arguments']) for c in calls],
+                             [{'q': 'alpha'}, {'q': 'beta'}])
+            self.assertEqual(body['choices'][0]['finish_reason'], 'tool_calls')
 
     async def test_codex_stream_chat_preserves_sse(self):
         self.attach(['codex'])
